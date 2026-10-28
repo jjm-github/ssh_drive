@@ -147,6 +147,7 @@ def _host_key() -> paramiko.PKey:
     return paramiko.Ed25519Key.from_private_key(io.StringIO(pem))
 
 
+@unittest.skipUnless(hasattr(socket, "AF_UNIX"), "тесты SSH-агента требуют Unix-сокет")
 class AgentTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

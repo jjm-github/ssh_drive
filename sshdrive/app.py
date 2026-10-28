@@ -1119,7 +1119,7 @@ class App(tk.Tk):
     def _about(self) -> None:
         messagebox.showinfo(
             "SSH Drive",
-            "SSH Drive 1.0\n\n"
+            "SSH Drive 1.1\n\n"
             "Монтирует папку SSH-сервера как диск Windows.\n"
             "Движок: rclone + WinFsp, интерфейс: tkinter.\n"
             "Закрытие окна сворачивает программу в трей; выход — через меню иконки.\n"

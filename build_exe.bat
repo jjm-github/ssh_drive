@@ -15,7 +15,7 @@ rem ---------------------------------------------------------------------------
 setlocal
 cd /d "%~dp0"
 
-set "APP_VERSION=1.0.0"
+set "APP_VERSION=1.1.0"
 
 set "BASEPY="
 py -3.13 -c "import sys" >nul 2>&1 && set "BASEPY=py -3.13"
@@ -75,6 +75,7 @@ if not exist "build\winfsp.msi" (
     goto :done
 )
 if not exist "build\msi" mkdir "build\msi"
+for /d %%D in ("%TEMP%\cab_0_WixUIExtension*") do rmdir /s /q "%%D"
 if exist "dist\SSHDrive-%APP_VERSION%-x64.msi" del /q "dist\SSHDrive-%APP_VERSION%-x64.msi"
 "build\wix\candle.exe" -nologo -arch x64 -ext WixUIExtension -dAppVersion=%APP_VERSION% -out "build\msi\sshdrive.wixobj" "installer\sshdrive.wxs"
 if errorlevel 1 goto :error
