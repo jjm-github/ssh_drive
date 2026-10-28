@@ -113,6 +113,9 @@ class ProfileDialog(tk.Toplevel):
         self.user = tk.StringVar(value=self._profile.user)
         self.auth = tk.StringVar(value=self._profile.auth)
         self.key_path = tk.StringVar(value=self._profile.key_path)
+        self.agent_key = self._profile.agent_key
+        self.agent_comment = self._profile.agent_comment
+        self.agent_text = tk.StringVar()
         self.passphrase = tk.StringVar(value="")
         self.password = tk.StringVar(value="")
         self.save_secret = tk.BooleanVar(value=self._profile.save_secret)
@@ -147,6 +150,10 @@ class ProfileDialog(tk.Toplevel):
         ).pack(side="left")
         ttk.Radiobutton(
             auth_box, text="по паролю", value="password", variable=self.auth, command=self._toggle
+        ).pack(side="left", padx=(16, 0))
+        ttk.Radiobutton(
+            auth_box, text="из SSH-агента (gpg4win, Pageant)", value="agent",
+            variable=self.auth, command=self._toggle,
         ).pack(side="left", padx=(16, 0))
 
         # --- блок ключа / пароля (взаимоисключающие) -------------------------
@@ -194,6 +201,29 @@ class ProfileDialog(tk.Toplevel):
             variable=self.save_secret,
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=0, pady=(6, 0))
 
+        # --- блок SSH-агента --------------------------------------------------
+        self.agent_frame = ttk.LabelFrame(auth_holder, text="SSH-агент", padding=8)
+        self.agent_frame.grid(row=0, column=0, sticky="ew")
+        self.agent_frame.columnconfigure(0, weight=1)
+        ttk.Label(self.agent_frame, textvariable=self.agent_text, wraplength=480, justify="left").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(
+            self.agent_frame, text="Выбрать ключ из агента…", command=self._pick_agent_key
+        ).grid(row=1, column=0, sticky="e", pady=(6, 0))
+        ttk.Label(
+            self.agent_frame,
+            text=(
+                "gpg4win: в gpg-agent.conf включите enable-putty-support или "
+                "enable-win32-openssh-support. Закрытый ключ остаётся в агенте; при входе "
+                "может появиться запрос PIN."
+            ),
+            wraplength=480,
+            foreground="#666666",
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self._show_agent_key()
+
         row += 1
         ttk.Label(body, text="Папка на сервере").grid(row=row, column=0, sticky="w", pady=(10, 3))
         ttk.Entry(body, textvariable=self.remote_path).grid(
@@ -235,7 +265,7 @@ class ProfileDialog(tk.Toplevel):
         )
         ttk.Label(
             body,
-            text="например: --vfs-cache-max-size 4G --transfers 4",
+            text="например: --vfs-cache-max-size 4G --transfers 4 (разрешены только безопасные флаги)",
             foreground="#666666",
         ).grid(row=row + 1, column=1, columnspan=3, sticky="w")
         row += 2
@@ -255,14 +285,32 @@ class ProfileDialog(tk.Toplevel):
 
     # ------------------------------------------------------------------
     def _toggle(self) -> None:
-        if self.auth.get() == "key":
-            self.pass_frame.grid_remove()
+        mode = self.auth.get()
+        for frame in (self.key_frame, self.pass_frame, self.agent_frame):
+            frame.grid_remove()
+        if mode == "key":
             self.key_frame.grid()
             if not self.key_path.get():
                 self.key_path.set(str(keys.default_key_path()))
+        elif mode == "agent":
+            self.agent_frame.grid()
         else:
-            self.key_frame.grid_remove()
             self.pass_frame.grid()
+
+    def _show_agent_key(self) -> None:
+        if self.agent_key:
+            label = self.agent_comment or "без комментария"
+            self.agent_text.set(f"Выбран ключ: {label}\n{self.agent_key.split()[0]}  …{self.agent_key[-16:]}")
+        else:
+            self.agent_text.set("Ключ не выбран. Нажмите «Выбрать ключ из агента…».")
+
+    def _pick_agent_key(self) -> None:
+        dialog = AgentKeysDialog(self)
+        self.wait_window(dialog)
+        if dialog.result is not None:
+            self.agent_key = dialog.result.line
+            self.agent_comment = dialog.result.comment
+            self._show_agent_key()
 
     def _browse_key(self) -> None:
         initial = Path(self.key_path.get()).parent if self.key_path.get() else paths.keys_dir()
@@ -327,8 +375,16 @@ class ProfileDialog(tk.Toplevel):
         if not (1 <= port <= 65535):
             messagebox.showerror("Профиль", "Порт вне диапазона 1–65535.", parent=self)
             return
+        try:
+            rclone.validate_extra(self.extra.get())
+        except rclone.RcloneError as exc:
+            messagebox.showerror("Профиль", str(exc), parent=self)
+            return
 
         auth = self.auth.get()
+        if auth == "agent" and not self.agent_key:
+            messagebox.showerror("Профиль", "Выберите ключ из SSH-агента.", parent=self)
+            return
         if auth == "key":
             key_path = self.key_path.get().strip()
             if not key_path:
@@ -340,6 +396,8 @@ class ProfileDialog(tk.Toplevel):
             self._profile.key_path = key_path
         else:
             self._profile.key_path = ""
+        self._profile.agent_key = self.agent_key if auth == "agent" else ""
+        self._profile.agent_comment = self.agent_comment if auth == "agent" else ""
 
         self._profile.name = name or f"{user}@{host}"
         self._profile.host = host
@@ -377,6 +435,71 @@ class ProfileDialog(tk.Toplevel):
 
     def _cancel(self) -> None:
         self.result = None
+        self.destroy()
+
+
+class AgentKeysDialog(tk.Toplevel):
+    """Список ключей, которые отдаёт SSH-агент (gpg-agent, Pageant, OpenSSH)."""
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.result: sshutil.AgentIdentity | None = None
+        self._items: dict[str, sshutil.AgentIdentity] = {}
+        self.title("Ключи SSH-агента")
+        self.geometry("720x300")
+        self.transient(parent)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        self.status = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.status, wraplength=680, justify="left").pack(anchor="w")
+
+        columns = ("type", "fingerprint", "comment")
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=8, selectmode="browse")
+        for column, text, width in (
+            ("type", "Тип", 110),
+            ("fingerprint", "Отпечаток", 300),
+            ("comment", "Комментарий", 260),
+        ):
+            self.tree.heading(column, text=text)
+            self.tree.column(column, width=width, anchor="w")
+        self.tree.pack(fill="both", expand=True, pady=(8, 8))
+        self.tree.bind("<Double-1>", lambda _e: self._ok())
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Обновить", command=self._load).pack(side="left")
+        ttk.Button(buttons, text="Отмена", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Выбрать", command=self._ok, style="Accent.TButton").pack(
+            side="right", padx=(0, 8)
+        )
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self._load()
+        center_on(parent, self)
+        self.grab_set()
+
+    def _load(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self._items = {}
+        try:
+            identities = sshutil.list_agent_keys()
+        except sshutil.SSHError as exc:
+            self.status.set(str(exc))
+            return
+        self.status.set("Двойной клик или «Выбрать» — использовать ключ для этого профиля.")
+        for index, identity in enumerate(identities):
+            iid = str(index)
+            self._items[iid] = identity
+            self.tree.insert(
+                "", "end", iid=iid,
+                values=(identity.key_type, identity.fingerprint, identity.comment),
+            )
+
+    def _ok(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        self.result = self._items.get(selection[0])
         self.destroy()
 
 

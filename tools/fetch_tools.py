@@ -25,6 +25,9 @@ def main() -> int:
     paths.rclone_exe = lambda: BUILD / "rclone.exe"  # type: ignore[assignment]
 
     exe = BUILD / "rclone.exe"
+    if exe.is_file() and not rclone.is_pinned_exe(exe):
+        print(f"{exe} не совпадает с закреплённой версией — скачиваю заново")
+        exe.unlink()
     if exe.is_file():
         print(f"rclone уже есть: {exe}")
     else:
@@ -41,6 +44,7 @@ def main() -> int:
     plain = BUILD / "winfsp.msi"
     if msi.resolve() != plain.resolve():
         shutil.copy2(msi, plain)
+    winfsp.cleanup_download(msi)
     print(f"WinFsp MSI: {versioned} ({versioned.stat().st_size // 1024} КБ)")
     return 0
 

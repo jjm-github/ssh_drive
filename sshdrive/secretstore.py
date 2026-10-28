@@ -1,8 +1,14 @@
 """Шифрование паролей через DPAPI (текущий пользователь Windows).
 
 Пароли никогда не пишутся в открытом виде: в profiles.json лежит только
-base64-строка, зашифрованная CryptProtectData. Расшифровать её может только
-тот же пользователь на той же машине.
+base64-строка, зашифрованная CryptProtectData. Расшифровать её может учётная
+запись Windows, под которой она создана (в домене с перемещаемым профилем —
+и на других компьютерах этой учётной записи).
+
+DPAPI не защищает от других программ, запущенных тем же пользователем: они
+тоже могут вызвать CryptUnprotectData. Дополнительная «энтропия» (v2) лишь
+отсекает универсальные утилиты, которые расшифровывают DPAPI-блоки без
+знания приложения.
 """
 
 from __future__ import annotations
@@ -13,6 +19,8 @@ import os
 from ctypes import wintypes
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
+V2_PREFIX = "v2:"
+_ENTROPY = b"SSHDrive/profiles/v2"
 
 
 class _DataBlob(ctypes.Structure):
@@ -69,38 +77,65 @@ def _take_blob(blob: _DataBlob) -> bytes:
             _kernel32.LocalFree(ctypes.cast(blob.pbData, ctypes.c_void_p))
 
 
-def protect(text: str) -> str:
-    """Шифрует строку и возвращает base64."""
-    if not text:
-        return ""
+def _dpapi_protect(data: bytes, entropy: bytes | None) -> bytes:
     if _crypt32 is None:
         raise RuntimeError("DPAPI доступен только на Windows")
-    data = text.encode("utf-8")
     in_blob, _keep = _make_blob(data)
+    ent_blob, _keep_ent = _make_blob(entropy) if entropy else (None, None)
     out_blob = _DataBlob()
     ok = _crypt32.CryptProtectData(
-        ctypes.byref(in_blob), None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out_blob)
+        ctypes.byref(in_blob),
+        None,
+        ctypes.byref(ent_blob) if ent_blob is not None else None,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
     )
     if not ok:
         raise ctypes.WinError(ctypes.get_last_error())
-    return base64.b64encode(_take_blob(out_blob)).decode("ascii")
+    return _take_blob(out_blob)
+
+
+def _dpapi_unprotect(raw: bytes, entropy: bytes | None) -> bytes:
+    if _crypt32 is None:
+        raise RuntimeError("DPAPI доступен только на Windows")
+    in_blob, _keep = _make_blob(raw)
+    ent_blob, _keep_ent = _make_blob(entropy) if entropy else (None, None)
+    out_blob = _DataBlob()
+    ok = _crypt32.CryptUnprotectData(
+        ctypes.byref(in_blob),
+        None,
+        ctypes.byref(ent_blob) if ent_blob is not None else None,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(out_blob),
+    )
+    if not ok:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return _take_blob(out_blob)
+
+
+def protect(text: str) -> str:
+    """Шифрует строку и возвращает «v2:» + base64."""
+    if not text:
+        return ""
+    encrypted = _dpapi_protect(text.encode("utf-8"), _ENTROPY)
+    return V2_PREFIX + base64.b64encode(encrypted).decode("ascii")
 
 
 def unprotect(token: str) -> str:
-    """Расшифровывает base64-строку, созданную protect()."""
+    """Расшифровывает строку, созданную protect().
+
+    Записи без префикса — прошлых версий (без энтропии) — читаются как раньше.
+    """
     if not token:
         return ""
-    if _crypt32 is None:
-        raise RuntimeError("DPAPI доступен только на Windows")
-    raw = base64.b64decode(token)
-    in_blob, _keep = _make_blob(raw)
-    out_blob = _DataBlob()
-    ok = _crypt32.CryptUnprotectData(
-        ctypes.byref(in_blob), None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out_blob)
-    )
-    if not ok:
-        raise ctypes.WinError(ctypes.get_last_error())
-    return _take_blob(out_blob).decode("utf-8")
+    if token.startswith(V2_PREFIX):
+        raw = base64.b64decode(token[len(V2_PREFIX):])
+        return _dpapi_unprotect(raw, _ENTROPY).decode("utf-8")
+    return _dpapi_unprotect(base64.b64decode(token), None).decode("utf-8")
 
 
 def try_unprotect(token: str) -> str | None:

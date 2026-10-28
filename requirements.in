@@ -1,0 +1,7 @@
+paramiko==5.1.0
+cryptography==50.0.2
+# Свежие pycparser 3.12 и pillow 13 требуют Python 3.11, а README обещает 3.10
+pycparser==3.11
+pystray>=0.19
+pillow>=10,<13
+asyncssh>=2.14

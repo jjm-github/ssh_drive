@@ -4,11 +4,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from . import paths
+
+_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+# «тип base64» публичного ключа, выбранного в SSH-агенте
+_AGENT_KEY_RE = re.compile(
+    r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) [A-Za-z0-9+/]+={0,3}"
+)
+AUTH_MODES = ("key", "password", "agent")
+
+
+def _drive_letter(value: object) -> str:
+    """Буква диска A-Z или пустая строка (значение приходит из JSON)."""
+    letter = str(value or "").strip().upper()[:1]
+    return letter if "A" <= letter <= "Z" else ""
 
 
 @dataclass
@@ -20,8 +34,10 @@ class Profile:
     host: str = ""
     port: int = 22
     user: str = ""
-    auth: str = "key"  # "key" | "password"
+    auth: str = "key"  # "key" | "password" | "agent"
     key_path: str = ""
+    agent_key: str = ""  # «тип base64» ключа из SSH-агента (auth = "agent")
+    agent_comment: str = ""  # только для показа в интерфейсе
     remote_path: str = ""
     drive: str = ""  # пусто = выбрать автоматически
     read_only: bool = False
@@ -33,11 +49,18 @@ class Profile:
     passphrase_enc: str = ""
 
     def __post_init__(self) -> None:
+        # id приходит из JSON и используется как идентификатор строки и потока.
+        if not isinstance(self.id, str) or not _ID_RE.fullmatch(self.id):
+            self.id = uuid.uuid4().hex[:12]
         self.port = int(self.port or 22)
-        self.drive = (self.drive or "").strip().upper()[:1]
-        self.last_drive = (self.last_drive or "").strip().upper()[:1]
-        if self.auth not in ("key", "password"):
+        self.drive = _drive_letter(self.drive)
+        self.last_drive = _drive_letter(self.last_drive)
+        if self.auth not in AUTH_MODES:
             self.auth = "key"
+        self.agent_key = str(self.agent_key or "").strip()
+        if not _AGENT_KEY_RE.fullmatch(self.agent_key):
+            self.agent_key = ""
+        self.agent_comment = str(self.agent_comment or "")[:80]
 
     # --- удобные представления для таблицы ---------------------------------
     @property
@@ -50,7 +73,7 @@ class Profile:
 
     @property
     def auth_label(self) -> str:
-        return "ключ" if self.auth == "key" else "пароль"
+        return {"key": "ключ", "agent": "агент"}.get(self.auth, "пароль")
 
     def to_dict(self) -> dict:
         return asdict(self)

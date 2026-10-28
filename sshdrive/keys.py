@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import os
+import re
 from pathlib import Path
 
 import paramiko
@@ -14,8 +14,16 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from . import paths
 
 
+_COMMENT_UNSAFE = re.compile(r"[^A-Za-z0-9@._+\-]")
+
+
 class KeyError_(Exception):
     """Ошибка работы с ключом."""
+
+
+def sanitize_comment(comment: str) -> str:
+    """Комментарий публичного ключа: только безопасные символы, одна строка."""
+    return _COMMENT_UNSAFE.sub("_", comment.strip())[:64]
 
 
 def default_key_path() -> Path:
@@ -47,18 +55,17 @@ def generate(path: Path, comment: str, passphrase: str = "") -> str:
         serialization.PrivateFormat.OpenSSH,
         encryption,
     )
-    # На Windows chmod не работает, но файл всё равно лежит в профиле пользователя.
+    # Сначала создаём пустой файл и закрываем доступ другим пользователям,
+    # и только потом пишем в него ключ (на Windows chmod права не меняет).
+    path.touch()
+    paths.restrict_to_owner(path)
     path.write_bytes(blob)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
     public = private.public_key().public_bytes(
         serialization.Encoding.OpenSSH,
         serialization.PublicFormat.OpenSSH,
     ).decode("ascii")
-    line = f"{public} {comment}".strip()
+    line = f"{public} {sanitize_comment(comment)}".strip()
     path.with_suffix(path.suffix + ".pub").write_text(line + "\n", encoding="utf-8")
     return line
 
@@ -103,24 +110,34 @@ def needs_passphrase(path: str | Path) -> bool:
 
 
 def public_line(path: str | Path, passphrase: str = "") -> str:
-    """Публичный ключ: сначала пробуем .pub, иначе вычисляем из приватного."""
-    path = Path(path)
-    pub_file = path.with_suffix(path.suffix + ".pub")
-    if pub_file.exists():
-        text = pub_file.read_text(encoding="utf-8", errors="replace").strip()
-        if text.startswith(("ssh-", "ecdsa-")):
-            return text
-    key = load(path, passphrase)
-    return f"{key.get_name()} {key.get_base64()}".strip()
+    """Публичный ключ в одну строку, вычисленный из приватного.
 
-
-def export_unencrypted(path: str | Path, passphrase: str, destination: Path) -> Path:
-    """Пишет незашифрованную копию ключа — её понимает rclone.
-
-    Копия создаётся только на время подключения и удаляется при отключении.
+    Файл .pub не доверенный: в нём может оказаться другой ключ или несколько
+    строк, и всё это уехало бы в authorized_keys на сервере. Из .pub берём
+    только комментарий, и лишь если ключ в нём совпадает с приватным.
     """
-    source = Path(path)
-    data = source.read_bytes()
+    path = Path(path)
+    key = load(path, passphrase)
+    line = f"{key.get_name()} {key.get_base64()}"
+    pub_file = path.with_suffix(path.suffix + ".pub")
+    try:
+        lines = pub_file.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+        parts = lines[0].split(None, 2) if lines else []
+    except OSError:
+        parts = []
+    if len(parts) == 3 and parts[0] == key.get_name() and parts[1] == key.get_base64():
+        comment = sanitize_comment(parts[2])
+        if comment:
+            line = f"{line} {comment}"
+    return line
+
+
+def export_unencrypted_pem(path: str | Path, passphrase: str) -> str:
+    """Незашифрованный PEM ключа — его понимает rclone (опция key_pem).
+
+    Возвращается строкой и никогда не пишется на диск.
+    """
+    data = Path(path).read_bytes()
     password = passphrase.encode("utf-8") if passphrase else None
     try:
         private = serialization.load_ssh_private_key(data, password=password)
@@ -131,13 +148,7 @@ def export_unencrypted(path: str | Path, passphrase: str, destination: Path) -> 
         serialization.PrivateFormat.OpenSSH,
         serialization.NoEncryption(),
     )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(blob)
-    try:
-        os.chmod(destination, 0o600)
-    except OSError:
-        pass
-    return destination
+    return blob.decode("ascii")
 
 
 def fingerprint(path: str | Path, passphrase: str = "") -> str:

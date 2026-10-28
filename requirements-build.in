@@ -1,0 +1,5 @@
+# Только для build_exe.bat (сборка exe). Windows-зависимости PyInstaller перечислены явно
+# и без маркеров: pip-compile на другой ОС их не видит.
+pyinstaller>=6
+pefile
+pywin32-ctypes

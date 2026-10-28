@@ -9,7 +9,8 @@ rem   dist\SSHDrive-offline.exe      ~53 МБ: плюс встроенные rcl
 rem   dist\SSHDrive-1.0.0-x64.msi    установщик: Program Files, меню «Пуск»,
 rem                                  ярлык на рабочем столе, rclone и WinFsp рядом
 rem
-rem  Нужен Python 3.10+ (лучше 3.13) и интернет на время сборки.
+rem  Нужен Python 3.10+ (лучше 3.13) и интернет для установки зависимостей.
+rem  Зависимости и PyInstaller закреплены с хэшами (requirements*.txt).
 rem ---------------------------------------------------------------------------
 setlocal
 cd /d "%~dp0"
@@ -37,7 +38,7 @@ if not exist "%BPY%" (
 
 echo [2/7] Устанавливаю зависимости...
 "%BPY%" -m pip install --disable-pip-version-check -q --upgrade pip
-"%BPY%" -m pip install --disable-pip-version-check -q -r requirements.txt pyinstaller
+"%BPY%" -m pip install --disable-pip-version-check -q -r requirements.txt -r requirements-build.txt
 if errorlevel 1 goto :error
 
 echo [3/7] Рисую иконку...

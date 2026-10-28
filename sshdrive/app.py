@@ -374,7 +374,7 @@ class App(tk.Tk):
         connected = bool(profile and profile.id in self.mounts and self.mounts[profile.id].alive)
         self.btn_disconnect.configure(state="normal" if connected else "disabled")
         self.btn_install_key.configure(
-            state="normal" if has and profile.auth == "key" else "disabled"
+            state="normal" if has and profile.auth in ("key", "agent") else "disabled"
         )
         connected_count = sum(1 for m in self.mounts.values() if m.alive)
         self.count_var.set(f"Дисков подключено: {connected_count}")
@@ -448,6 +448,15 @@ class App(tk.Tk):
         password = ""
         passphrase = ""
 
+        if profile.auth == "agent":
+            if not profile.agent_key:
+                if interactive:
+                    messagebox.showerror(
+                        "SSH-агент", "В профиле не выбран ключ. Нажмите «Изменить»."
+                    )
+                return None
+            return password, passphrase  # закрытый ключ остаётся в агенте
+
         if profile.auth == "password":
             if profile.save_secret and profile.password_enc:
                 password = try_unprotect(profile.password_enc) or ""
@@ -500,35 +509,38 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     # Проверка ключа хоста (вызывается из фонового потока)
     # ------------------------------------------------------------------
-    def confirm_host_key(
-        self, host: str, keytype: str, fingerprint: str, existing: tuple[str, ...] = ()
-    ) -> bool:
+    def _ask_yes_no_sync(self, title: str, text: str) -> bool:
+        """Показывает вопрос «Да/Нет» из фонового потока; без ответа — «Нет»."""
         event = threading.Event()
         result = {"ok": False}
 
-        if existing:
-            intro = (
-                f"Для {host} уже сохранены ключи: {', '.join(existing)}.\n"
-                f"Сервер предлагает ещё один ключ, тип {keytype}.\n\n"
-                "Это нормально, если сервер переустановили или добавили новый тип "
-                "ключа. Если вы этого не ожидали — не доверяйте."
-            )
-        else:
-            intro = f"Хост {host} ещё не известен."
-
         def ask() -> None:
-            result["ok"] = messagebox.askyesno(
-                "Новый SSH-сервер",
-                f"{intro}\n\n"
-                f"Тип ключа: {keytype}\nОтпечаток: {fingerprint}\n\n"
-                "Доверять этому серверу и запомнить ключ?",
-                parent=self,
-            )
+            result["ok"] = messagebox.askyesno(title, text, parent=self)
             event.set()
 
         self.ui(ask)
         event.wait(timeout=300)
         return bool(result["ok"])
+
+    def confirm_host_key(self, host: str, keytype: str, fingerprint: str) -> bool:
+        # Сюда доходим только для хоста без сохранённого ключа: если ключ уже
+        # известен, а сервер предъявил другой, подключение блокируется раньше.
+        return self._ask_yes_no_sync(
+            "Новый SSH-сервер",
+            f"Хост {host} ещё не известен.\n\n"
+            f"Тип ключа: {keytype}\nОтпечаток: {fingerprint}\n\n"
+            "Сверьте отпечаток с тем, который вам дал администратор сервера. "
+            "Доверять этому серверу и запомнить ключ?",
+        )
+
+    def confirm_admin_keys(self) -> bool:
+        return self._ask_yes_no_sync(
+            "Сервер Windows: учётная запись администратора",
+            "Вы вошли на сервер как администратор. Общий файл "
+            "administrators_authorized_keys действует для ВСЕХ администраторов "
+            "сервера: ключ из него позволит войти под любой из этих учётных записей.\n\n"
+            "Добавить ключ и в этот файл? (Обычно хватает «Нет».)",
+        )
 
     # ------------------------------------------------------------------
     # Подключение / отключение
@@ -640,6 +652,7 @@ class App(tk.Tk):
                     profile.user,
                     password=password if profile.auth == "password" else None,
                     pkey=pkey,
+                    agent_key=profile.agent_key if profile.auth == "agent" else None,
                     known_hosts=paths.known_hosts_file(),
                     confirm=self.confirm_host_key,
                 )
@@ -773,6 +786,7 @@ class App(tk.Tk):
                 profile.user,
                 password=password if profile.auth == "password" else None,
                 pkey=pkey,
+                agent_key=profile.agent_key if profile.auth == "agent" else None,
                 known_hosts=paths.known_hosts_file(),
                 confirm=self.confirm_host_key,
             )
@@ -786,7 +800,10 @@ class App(tk.Tk):
 
     def _install_key_selected(self) -> None:
         profile = self._selected_profile()
-        if profile is None or profile.auth != "key":
+        if profile is None or profile.auth not in ("key", "agent"):
+            return
+        if profile.auth == "agent":
+            self._install_agent_key(profile)
             return
         key_path = Path(profile.key_path) if profile.key_path else keys.default_key_path()
 
@@ -835,71 +852,97 @@ class App(tk.Tk):
 
         pubkey = keys.public_line(key_path, passphrase)
 
-        def work() -> None:
-            pkey = keys.load(key_path, passphrase)
-            try:
-                info = sshutil.test_login(
-                    profile.host,
-                    profile.port,
-                    profile.user,
-                    pkey=pkey,
-                    known_hosts=paths.known_hosts_file(),
-                    confirm=self.confirm_host_key,
-                )
-                self.log(f"Ключ уже работает: {profile.target} → {info['home']}", "ok")
-                return
-            except sshutil.SSHError as exc:
-                if "отклонил вход" not in str(exc):
-                    raise
-                self.log("Ключ на сервере ещё не установлен — добавляю через вход по паролю…")
-
-            password = stored_password
-            if not password:
-                answer = self.ask_secret_sync(
-                    "Пароль SSH",
-                    f"Пароль {profile.user}@{profile.host} нужен один раз, "
-                    "чтобы добавить ключ на сервер.",
-                    save_allowed=True,
-                    save_default=bool(profile.save_secret),
-                )
-                if answer is None:
-                    self.log("Установка ключа отменена", "warn")
-                    return
-                password, remember = answer
-                if not password:
-                    self.log("Установка ключа отменена: пустой пароль", "warn")
-                    return
-                if remember:
-                    self.ui(self._remember_password, profile, password)
-
-            client = sshutil.connect(
-                profile.host,
-                profile.port,
-                profile.user,
-                password=password,
-                known_hosts=paths.known_hosts_file(),
-                confirm=self.confirm_host_key,
-            )
-            try:
-                result = sshutil.install_public_key(client, pubkey)
-            finally:
-                client.close()
-            self.log(f"Сервер: {result}", "ok")
-
-            info = sshutil.test_login(
-                profile.host,
-                profile.port,
-                profile.user,
-                pkey=keys.load(key_path, passphrase),
-                known_hosts=paths.known_hosts_file(),
-                confirm=self.confirm_host_key,
-            )
-            self.log(
-                f"Готово: вход по ключу работает, домашняя папка {info['home']}", "ok"
-            )
-
         self.log(f"Устанавливаю ключ {key_path.name} на {profile.target}…")
-        self.run_bg("Установка ключа", work)
+        self.run_bg(
+            "Установка ключа",
+            lambda: self._install_key_work(
+                profile, pubkey, stored_password,
+                lambda: {"pkey": keys.load(key_path, passphrase)},
+            ),
+        )
+
+    def _install_agent_key(self, profile: Profile) -> None:
+        """Добавляет на сервер публичный ключ, который держит SSH-агент."""
+        if not profile.agent_key:
+            messagebox.showerror("SSH-агент", "В профиле не выбран ключ. Нажмите «Изменить».")
+            return
+        comment = keys.sanitize_comment(profile.agent_comment or f"{profile.user}@{profile.host}")
+        pubkey = f"{profile.agent_key} {comment}".strip()
+        stored_password = ""
+        if profile.save_secret and profile.password_enc:
+            stored_password = try_unprotect(profile.password_enc) or ""
+        self.log(f"Устанавливаю ключ из агента на {profile.target}…")
+        self.run_bg(
+            "Установка ключа",
+            lambda: self._install_key_work(
+                profile, pubkey, stored_password, lambda: {"agent_key": profile.agent_key}
+            ),
+        )
+
+    def _install_key_work(
+        self, profile: Profile, pubkey: str, stored_password: str, login_kwargs
+    ) -> None:
+        """Фоновая часть установки ключа (файловый ключ или ключ из агента).
+
+        login_kwargs() даёт параметры входа по ключу для sshutil.test_login.
+        """
+
+        def login() -> dict:
+            return sshutil.test_login(
+                profile.host,
+                profile.port,
+                profile.user,
+                known_hosts=paths.known_hosts_file(),
+                confirm=self.confirm_host_key,
+                **login_kwargs(),
+            )
+
+        try:
+            info = login()
+            self.log(f"Ключ уже работает: {profile.target} → {info['home']}", "ok")
+            return
+        except sshutil.SSHError as exc:
+            if "отклонил вход" not in str(exc):
+                raise
+            self.log("Ключ на сервере ещё не установлен — добавляю через вход по паролю…")
+
+        password = stored_password
+        if not password:
+            answer = self.ask_secret_sync(
+                "Пароль SSH",
+                f"Пароль {profile.user}@{profile.host} нужен один раз, "
+                "чтобы добавить ключ на сервер.",
+                save_allowed=True,
+                save_default=bool(profile.save_secret),
+            )
+            if answer is None:
+                self.log("Установка ключа отменена", "warn")
+                return
+            password, remember = answer
+            if not password:
+                self.log("Установка ключа отменена: пустой пароль", "warn")
+                return
+            if remember:
+                self.ui(self._remember_password, profile, password)
+
+        client = sshutil.connect(
+            profile.host,
+            profile.port,
+            profile.user,
+            password=password,
+            known_hosts=paths.known_hosts_file(),
+            confirm=self.confirm_host_key,
+        )
+        try:
+            result = sshutil.install_public_key(
+                client, pubkey, confirm_admin=self.confirm_admin_keys
+            )
+        finally:
+            client.close()
+        self.log(f"Сервер: {result}", "ok")
+
+        info = login()
+        self.log(f"Готово: вход по ключу работает, домашняя папка {info['home']}", "ok")
 
     def _remember_password(self, profile: Profile, password: str) -> None:
         profile.password_enc = protect(password)
@@ -951,7 +994,7 @@ class App(tk.Tk):
                 self.log("rclone не найден — без него нельзя создать диск.", "warn")
                 self.ui(self._offer_rclone)
             else:
-                self.log(f"rclone {version} найден")
+                self.log(f"rclone {version} найден: {exe}")
             if not installed:
                 self.log("WinFsp не найден — драйвер нужен для диска в Windows.", "warn")
                 self.ui(self._offer_winfsp)
@@ -1081,7 +1124,7 @@ class App(tk.Tk):
             "Движок: rclone + WinFsp, интерфейс: tkinter.\n"
             "Закрытие окна сворачивает программу в трей; выход — через меню иконки.\n"
             "Подключённые диски запоминаются и поднимаются при следующем запуске.\n"
-            "Пароли хранятся в profiles.json в зашифрованном виде (DPAPI).",
+            "Пароли хранятся в profiles.json в зашифрованном виде (DPAPI, текущий пользователь Windows).",
         )
 
     # ------------------------------------------------------------------

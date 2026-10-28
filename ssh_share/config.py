@@ -2,17 +2,81 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
-from sshdrive.secretstore import protect, try_unprotect
+from sshdrive.secretstore import try_unprotect
 
 from . import paths
 
 USER_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,32}")
+
+# Пароли пользователей хранятся не в обратимом виде, а как scrypt-хэш: серверу
+# нужна только проверка. Параметры (память 32 МиБ, ~0,1 с) — компромисс между
+# защитой от перебора украденного файла и нагрузкой на сервер.
+MIN_PASSWORD_LENGTH = 10
+_SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**15, 8, 1
+_SCRYPT_MAXMEM = 128 * 1024 * 1024
+_SCRYPT_LIMITS = (2**17, 16, 4)  # потолок параметров из файла (защита от «бомбы» в конфиге)
+
+
+def check_new_password(plain: str) -> str | None:
+    """Сообщение об ошибке для слишком слабого нового пароля или None."""
+    if len(plain) < MIN_PASSWORD_LENGTH:
+        return f"Пароль слишком короткий: нужно не меньше {MIN_PASSWORD_LENGTH} символов."
+    if len(set(plain)) < 4:
+        return "Пароль слишком простой: используйте больше разных символов."
+    return None
+
+
+def hash_password(plain: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.scrypt(
+        plain.encode("utf-8"), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
+        maxmem=_SCRYPT_MAXMEM, dklen=32,
+    )
+    b64 = lambda raw: base64.b64encode(raw).decode("ascii")  # noqa: E731
+    return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${b64(salt)}${b64(digest)}"
+
+
+def verify_password_hash(plain: str, stored: str) -> bool:
+    """Сверяет пароль с записью hash_password(); любой мусор в записи даёт False."""
+    try:
+        scheme, n, r, p, salt_b64, digest_b64 = stored.split("$")
+        n, r, p = int(n), int(r), int(p)
+        salt, expected = base64.b64decode(salt_b64), base64.b64decode(digest_b64)
+        if scheme != "scrypt" or not (2 <= n <= _SCRYPT_LIMITS[0] and n & (n - 1) == 0):
+            return False
+        if not (1 <= r <= _SCRYPT_LIMITS[1] and 1 <= p <= _SCRYPT_LIMITS[2] and len(expected) == 32):
+            return False
+        actual = hashlib.scrypt(
+            plain.encode("utf-8"), salt=salt, n=n, r=r, p=p, maxmem=_SCRYPT_MAXMEM, dklen=32
+        )
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(actual, expected)
+
+
+_DUMMY_HASH = ""
+
+
+def ensure_dummy_hash() -> str:
+    """Хэш-«пустышка» для неизвестных пользователей (считается один раз)."""
+    global _DUMMY_HASH
+    if not _DUMMY_HASH:
+        _DUMMY_HASH = hash_password("dummy-password-for-timing")
+    return _DUMMY_HASH
+
+
+def burn_password_check(plain: str) -> None:
+    """Тратит столько же времени, сколько реальная проверка (неизвестный пользователь)."""
+    verify_password_hash(plain, ensure_dummy_hash())
 
 
 @dataclass
@@ -20,20 +84,43 @@ class ShareUser:
     """Пользователь, которому разрешён доступ к папке."""
 
     name: str = ""
-    password_enc: str = ""
+    password_enc: str = ""  # устаревшее: пароль под DPAPI (переносится в password_hash)
     keys: list[str] = field(default_factory=list)  # публичные ключи (OpenSSH, одна строка)
     read_only: bool = True
+    password_hash: str = ""  # scrypt-хэш пароля
 
     @property
     def has_password(self) -> bool:
-        return bool(self.password_enc)
+        return bool(self.password_hash or self.password_enc)
 
     def password(self) -> str:
-        """Расшифрованный пароль (или пустая строка)."""
+        """Устаревшая запись: расшифрованный пароль (или пустая строка)."""
         return try_unprotect(self.password_enc) or ""
 
     def set_password(self, plain: str) -> None:
-        self.password_enc = protect(plain) if plain else ""
+        self.password_hash = hash_password(plain) if plain else ""
+        self.password_enc = ""
+
+    def check_password(self, plain: str) -> bool:
+        if self.password_hash:
+            return verify_password_hash(plain, self.password_hash)
+        if self.password_enc:
+            expected = self.password()
+            return bool(expected) and hmac.compare_digest(
+                expected.encode("utf-8"), plain.encode("utf-8")
+            )
+        burn_password_check(plain)
+        return False
+
+    def migrate_password(self) -> bool:
+        """Переносит старый пароль под DPAPI в scrypt-хэш. True, если запись изменилась."""
+        if self.password_hash or not self.password_enc:
+            return False
+        plain = self.password()
+        if not plain:
+            return False
+        self.set_password(plain)
+        return True
 
     def auth_label(self) -> str:
         if self.has_password and self.keys:
@@ -120,6 +207,11 @@ class ConfigStore:
             return
         if isinstance(raw, dict):
             self.config = ShareConfig.from_dict(raw)
+        if any([user.migrate_password() for user in self.config.users]):
+            try:
+                self.save()
+            except OSError:
+                pass  # перенесётся при следующем сохранении
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

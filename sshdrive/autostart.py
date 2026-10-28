@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import paths, pwsh
+
 SHORTCUT_NAME = "SSH Drive.lnk"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -41,27 +43,22 @@ def _target() -> tuple[Path, str, Path]:
     return exe, "-m sshdrive --tray", workdir
 
 
-def _q(value: object) -> str:
-    """Строка в одинарных кавычках для PowerShell."""
-    return "'" + str(value).replace("'", "''") + "'"
-
-
 def enable() -> None:
     exe, args, workdir = _target()
     link = shortcut_path()
     link.parent.mkdir(parents=True, exist_ok=True)
     script = (
         "$ws = New-Object -ComObject WScript.Shell; "
-        f"$sc = $ws.CreateShortcut({_q(link)}); "
-        f"$sc.TargetPath = {_q(exe)}; "
-        f"$sc.Arguments = {_q(args)}; "
-        f"$sc.WorkingDirectory = {_q(workdir)}; "
-        f"$sc.IconLocation = {_q(f'{exe},0')}; "
+        f"$sc = $ws.CreateShortcut({pwsh.quote(link)}); "
+        f"$sc.TargetPath = {pwsh.quote(exe)}; "
+        f"$sc.Arguments = {pwsh.quote(args)}; "
+        f"$sc.WorkingDirectory = {pwsh.quote(workdir)}; "
+        f"$sc.IconLocation = {pwsh.quote(f'{exe},0')}; "
         "$sc.Description = 'SSH Drive'; "
         "$sc.Save()"
     )
     result = subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        [paths.powershell_exe(), *pwsh.encoded_args(script)],
         capture_output=True,
         text=True,
         timeout=60,

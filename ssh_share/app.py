@@ -14,10 +14,17 @@ from tkinter import filedialog, messagebox, ttk
 
 import asyncssh
 
-from sshdrive.secretstore import protect
-
 from . import __version__, paths
-from .config import ConfigStore, ShareConfig, ShareUser, USER_NAME_RE, validate_share
+from .config import (
+    ConfigStore,
+    MIN_PASSWORD_LENGTH,
+    ShareConfig,
+    ShareUser,
+    USER_NAME_RE,
+    check_new_password,
+    hash_password,
+    validate_share,
+)
 from .server import ShareError, ShareServer
 
 LEVEL_COLORS = {
@@ -123,7 +130,7 @@ class UserDialog(tk.Toplevel):
             command=self._toggle_password,
         ).grid(row=0, column=1, padx=(8, 0))
         row += 1
-        if user.password_enc:
+        if user.has_password:
             ttk.Checkbutton(
                 body,
                 text="Удалить сохранённый пароль (оставить только ключи)",
@@ -132,7 +139,7 @@ class UserDialog(tk.Toplevel):
             row += 1
         ttk.Label(
             body,
-            text="пусто = не менять сохранённый пароль",
+            text=f"не меньше {MIN_PASSWORD_LENGTH} символов; пусто = не менять сохранённый пароль",
             foreground="#666666",
         ).grid(row=row, column=1, sticky="w")
 
@@ -227,13 +234,18 @@ class UserDialog(tk.Toplevel):
             if key and key not in keys:
                 keys.append(key)
 
-        password_enc = self._user.password_enc
+        password_hash = self._user.password_hash
+        password_enc = self._user.password_enc  # устаревшая запись, перенесётся при запуске
         if self.remove_password.get():
-            password_enc = ""
+            password_hash = password_enc = ""
         elif self.password.get():
-            password_enc = protect(self.password.get())
+            problem = check_new_password(self.password.get())
+            if problem:
+                messagebox.showerror("Пароль", problem, parent=self)
+                return
+            password_hash, password_enc = hash_password(self.password.get()), ""
 
-        if not password_enc and not keys:
+        if not password_hash and not password_enc and not keys:
             messagebox.showerror(
                 "Пользователь",
                 "Нужен пароль или хотя бы один публичный ключ.",
@@ -243,6 +255,7 @@ class UserDialog(tk.Toplevel):
 
         self.result = ShareUser(
             name=name,
+            password_hash=password_hash,
             password_enc=password_enc,
             keys=keys,
             read_only=bool(self.read_only.get()),
